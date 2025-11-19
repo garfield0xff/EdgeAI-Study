@@ -83,7 +83,7 @@ public:
         // 캐시 효율떄문에 변경하는겁니다. 배치 사이즈에서 채널로 loop 돌리는게 일반적이니까요. 민기님 한번 들여다 보시면 좋을듯
         // 현재는 안해도 상관은 없습니다.
         tensor = tensor.permute({0, 3, 1, 2});
-        tensor = tensor.to(device);
+        // tensor = tensor.to(device);
         
         return tensor.clone();
     }
@@ -148,44 +148,87 @@ public:
 
     // Run TVM module
     torch::Tensor runTVM(const torch::Tensor& input) {
-        std::cout << "runTVM start!!" << "\n";
-        // Create tvm NDArray
-        tvm::runtime::NDArray input_arr = createNDArray(input);
-        // set input_arr to encoder
-        encoder_set_input("input_0", input_arr);
-        // run encoder
-        encoder_run();
-        // allocate encoder output
-        tvm::runtime::NDArray encoder_output = encoder_get_output(0);
+        std::cout << "runTVM start!!\n";
 
-        // Get encoder output shape
-        std::vector<int64_t> enc_shape;
-        for (int i = 0; i < encoder_output->ndim; ++i) {
-            enc_shape.push_back(encoder_output->shape[i]);
+        // ===== [1️⃣ Encoder 실행] =====
+        torch::Tensor input_c = input.clone().contiguous();
+        tvm::runtime::NDArray input_arr = createNDArray(input_c);
+        encoder_set_input("input_0", input_arr);
+        encoder_run();
+
+        // ===== [2️⃣ 인코더 출력 전부 수집 + deep copy] =====
+        std::vector<tvm::runtime::NDArray> encoder_outputs;
+        for (int i = 0; ; i++) {
+            try {
+                tvm::runtime::NDArray out_raw = encoder_get_output(i);
+
+                // 🎯 TVM 내부 static buffer → 독립 buffer로 deep copy
+                tvm::runtime::NDArray out =
+                    tvm::runtime::NDArray::Empty(
+                        out_raw.Shape(),
+                        out_raw.DataType(),
+                        device
+                    );
+
+                out_raw.CopyTo(out);
+                encoder_outputs.push_back(out);
+
+            } catch (...) {
+                break;
+            }
+        }
+        // TVM Relay decoder 입력 이름(순서 고정)
+        static const std::vector<std::string> decoder_input_names = {
+            "argument_1_1",   // encoder_outputs[0]
+            "argument_2_1",   // encoder_outputs[1]
+            "argument_3_1",   // encoder_outputs[2]
+            "argument_4_1",   // encoder_outputs[3]
+            "input_3"         // encoder_outputs[4]
+        };
+
+        if (encoder_outputs.empty()) {
+            throw std::runtime_error("❌ No encoder outputs found!");
         }
 
-        // Copy encoder output to torch tensor
-        auto enc_tensor = torch::empty(enc_shape, torch::kFloat32);
-        encoder_output.CopyToBytes(enc_tensor.data_ptr(), enc_tensor.numel() * sizeof(float));
+        // ===== [3️⃣ 각 인코더 출력을 float32로 디코더에 전달] =====
+        for (size_t i = 0; i < encoder_outputs.size(); ++i) {
+            auto& out = encoder_outputs[i];
 
-        // Decoder inference
-        tvm::runtime::NDArray dec_input_arr = createNDArray(enc_tensor);
-        decoder_set_input("input", dec_input_arr);
+            // FP16 → FP32 자동 변환 함수 호출
+            torch::Tensor t_fp32 = tvmNDArrayToFP32(out);
+            t_fp32 = t_fp32.clone().contiguous();
+
+            // TVM NDArray 생성
+            tvm::runtime::NDArray arr = createNDArrayWithDType(i, t_fp32);
+
+            // correct decoder input name
+            decoder_set_input(decoder_input_names[i].c_str(), arr);
+        }
+
+        // ===== [4️⃣ 디코더 실행 및 출력 복사] =====
         decoder_run();
         tvm::runtime::NDArray decoder_output = decoder_get_output(0);
 
-        // Get decoder output shape
         std::vector<int64_t> dec_shape;
-        for (int i = 0; i < decoder_output->ndim; ++i) {
+        for (int i = 0; i < decoder_output->ndim; ++i)
             dec_shape.push_back(decoder_output->shape[i]);
-        }
 
-        // Copy decoder output to torch tensor
         auto dec_tensor = torch::empty(dec_shape, torch::kFloat32);
         decoder_output.CopyToBytes(dec_tensor.data_ptr(), dec_tensor.numel() * sizeof(float));
-        std::cout << "runTVM end!!" << "\n";
+
+        for (auto s : dec_tensor.sizes()) std::cout << s << " ";
+        std::cout << "\n";
+
+        std::cout << "Decoder output stats: min="
+                << dec_tensor.min().item<float>()
+                << ", max=" << dec_tensor.max().item<float>()
+                << ", mean=" << dec_tensor.mean().item<float>() << "\n";
+
+        std::cout << "runTVM end!!\n";
         return dec_tensor;
     }
+
+
 
     void visualize(const cv::Mat& input_image, const cv::Mat& depth_map, const cv::Mat& colorized) {
         // Create display images
@@ -282,77 +325,19 @@ public:
         }
     }
 
-    // Create NDArray from torch::Tensor
-    tvm::runtime::NDArray createNDArray(const torch::Tensor& t) {
-        std::vector<int64_t> shape;
-        for (int i = 0; i < t.dim(); ++i) {
-            std::cout << "i: " << i << "size: " << t.size(i) << "\n";
-            shape.push_back(t.size(i));
-        }
-
-        DLDataType dtype = getDLDataType(t);
-        DLDevice dev = getDLDevice(t);
-
-        // Create NDArray with TVM's memory management
-        tvm::runtime::NDArray arr = tvm::runtime::NDArray::Empty(shape, dtype, dev);
-
-        // Copy data from torch tensor to NDArray
-        arr.CopyFromBytes(t.data_ptr(), t.numel() * t.element_size());
-
-        return arr;
-    }
-
     DLDataType getDLDataType(const torch::Tensor& t) {
-        DLDataType dtype;
-        dtype.lanes = 1;
-
-        switch (t.scalar_type()) {
-            case torch::kFloat32:
-                dtype.code = kDLFloat;
-                dtype.bits = 32;
-                break;
-            case torch::kFloat64:
-                dtype.code = kDLFloat;
-                dtype.bits = 64;
-                break;
-            case torch::kFloat16:
-                dtype.code = kDLFloat;
-                dtype.bits = 16;
-                break;
-            case torch::kInt32:
-                dtype.code = kDLInt;
-                dtype.bits = 32;
-                break;
-            case torch::kInt64:
-                dtype.code = kDLInt;
-                dtype.bits = 64;
-                break;
-            case torch::kInt16:
-                dtype.code = kDLInt;
-                dtype.bits = 16;
-                break;
-            case torch::kInt8:
-                dtype.code = kDLInt;
-                dtype.bits = 8;
-                break;
-            case torch::kUInt8:
-                dtype.code = kDLUInt;
-                dtype.bits = 8;
-                break;
-            default:
-                throw std::runtime_error("Unsupported data type");
+        DLDataType datatype;
+        datatype.lanes = 1;
+        auto dtype = t.dtype();
+        if (dtype == torch::kFloat32) {
+            datatype.code = kDLFloat;
+            datatype.bits = 32;
         }
-
-        return dtype;
-    }
-
-    // DLTensor 메모리 해제 (shape, strides만 해제, 데이터는 torch가 관리)
-    void freeDLTensor(DLTensor* dl_tensor) {
-        if (dl_tensor) {
-            delete[] dl_tensor->shape;
-            delete[] dl_tensor->strides;
-            delete dl_tensor;
+        else if (dtype == torch::kFloat16) {
+            datatype.code = kDLFloat;
+            datatype.bits = 16;
         }
+        return datatype;
     }
 
     // torch::Tensor의 DLDevice 변환
@@ -371,6 +356,85 @@ public:
 
         return device;
     }
+
+    // Create NDArray from torch::Tensor
+    tvm::runtime::NDArray createNDArray(const torch::Tensor& t) {
+
+        std::vector<int64_t> shape;
+        for (int i = 0; i < t.dim(); ++i)
+            shape.push_back(t.size(i));
+
+        // 3) dtype + device
+        DLDataType dtype = getDLDataType(t);
+        DLDevice dev = getDLDevice(t);
+
+        // 4) create NDArray
+        tvm::runtime::NDArray arr = tvm::runtime::NDArray::Empty(shape, dtype, dev);
+
+        // 5) compute total bytes EXACTLY as TVM needs
+        size_t num_elems = 1;
+        for (auto s : shape){
+            num_elems *= s;
+        } 
+
+
+        size_t tvm_bytes = num_elems * (dtype.bits / 8);
+
+        // 6) copy EXACT number of bytes
+        arr.CopyFromBytes(t.data_ptr(), tvm_bytes);
+
+        return arr;
+    }
+
+
+
+    // Torch tensor -> TVM NDArray (dtype 지정 가능)
+    tvm::runtime::NDArray createNDArrayWithDType(size_t i, const torch::Tensor& t) {
+        std::vector<int64_t> shape;
+        size_t tvm_bytes;
+        for (int i = 0; i < t.dim(); ++i)
+            shape.push_back(t.size(i));
+
+        DLDataType dtype = getDLDataType(t);
+        DLDevice dev = getDLDevice(t);
+
+        tvm::runtime::NDArray arr = tvm::runtime::NDArray::Empty(shape, dtype, dev);
+
+        size_t num_elems = 1;
+        for (auto s : shape){
+            num_elems *= s;
+        } 
+        tvm_bytes = num_elems * (dtype.bits / 8);
+        // 6) copy EXACT number of bytes
+        arr.CopyFromBytes(t.data_ptr(), tvm_bytes);
+
+        return arr;
+    }
+    torch::Tensor tvmNDArrayToFP32(const tvm::runtime::NDArray& arr) {
+        const DLTensor* t = arr.operator->();
+
+        std::vector<int64_t> shape(t->shape, t->shape + t->ndim);
+
+        // FP16 → FP32 처리
+        if (t->dtype.code == kDLFloat && t->dtype.bits == 16) {
+            auto t_fp16 = torch::from_blob(
+                t->data,
+                shape,
+                torch::TensorOptions().dtype(torch::kFloat16)
+            ).clone();
+
+            return t_fp16.to(torch::kFloat32);
+        }
+
+        // FP32: 그대로 가져오기
+        return torch::from_blob(
+            t->data,
+            shape,
+            torch::TensorOptions().dtype(torch::kFloat32)
+        ).clone();
+    }
+
+
 
 };
 
