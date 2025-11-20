@@ -1357,15 +1357,10 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         Torch Tensor -> tvm.nd.NDArray (float64를 float32로 내림, DLPack 사용, 안전 fallback 포함)
         """
         t = t.detach().cpu().contiguous()
-        # 가장 흔한 원인: float64 -> float32 강제
-        if t.dtype == torch.float64:
-            t = t.float()
-        try:
-            # 매 호출마다 새로운 캡슐을 만들어야 함 (PyCapsule 재사용 금지)
-            return tvm.nd.from_dlpack(torch.utils.dlpack.to_dlpack(t))
-        except Exception:
-            # 드물게 DLPack 실패 시 numpy로 복사 (dtype도 확실히 맞춤)
-            return tvm.nd.array(t.numpy().astype(np.float32))
+        # # 가장 흔한 원인: float64 -> float32 강제
+        t = t.to(torch.float32)
+        # 매 호출마다 새로운 캡슐을 만들어야 함 (PyCapsule 재사용 금지)
+        return tvm.nd.from_dlpack(torch.utils.dlpack.to_dlpack(t))
 
     def build_binding(self, exported_program, keep_params_as_input: bool):
         # buffers + constants
