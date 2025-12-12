@@ -1,4 +1,4 @@
-# Synapse - Embedded & Edge Study
+#Embedded & Edge Study
 
 
 ## Team
