@@ -41,18 +41,6 @@ public:
         encoder_mod = tvm::runtime::Module::LoadFromFile(encoder_so);
         decoder_mod = tvm::runtime::Module::LoadFromFile(decoder_so);
 
-        tvm::runtime::Module encoder_exec = encoder_mod.GetFunction("default")(device);
-        tvm::runtime::Module decoder_exec = decoder_mod.GetFunction("default")(device);
-
-        encoder_set_input = encoder_exec.GetFunction("set_input");
-        encoder_run = encoder_exec.GetFunction("run");
-        encoder_get_output = encoder_exec.GetFunction("get_output");
-
-        decoder_set_input = decoder_exec.GetFunction("set_input");
-        decoder_run = decoder_exec.GetFunction("run");
-        decoder_get_output = decoder_exec.GetFunction("get_output");
-
-        std::cout << "✅ TVM AOT modules loaded successfully!\n";
     }
 
     cv::Mat preprocessImage(const cv::Mat& image) {
@@ -148,7 +136,17 @@ public:
 
     // Run TVM module
     torch::Tensor runTVM(const torch::Tensor& input) {
-        std::cout << "runTVM start!!\n";
+
+        tvm::runtime::Module encoder_exec = encoder_mod.GetFunction("default")(device);
+        tvm::runtime::Module decoder_exec = decoder_mod.GetFunction("default")(device);
+
+        encoder_set_input = encoder_exec.GetFunction("set_input");
+        encoder_run = encoder_exec.GetFunction("run");
+        encoder_get_output = encoder_exec.GetFunction("get_output");
+
+        decoder_set_input = decoder_exec.GetFunction("set_input");
+        decoder_run = decoder_exec.GetFunction("run");
+        decoder_get_output = decoder_exec.GetFunction("get_output");
 
         // ===== [1️⃣ Encoder 실행] =====
         torch::Tensor input_c = input.clone().contiguous();
@@ -179,11 +177,11 @@ public:
         }
         // TVM Relay decoder 입력 이름(순서 고정)
         static const std::vector<std::string> decoder_input_names = {
-            "argument_1_1",   // encoder_outputs[0]
-            "argument_2_1",   // encoder_outputs[1]
-            "argument_3_1",   // encoder_outputs[2]
-            "argument_4_1",   // encoder_outputs[3]
-            "input_3"         // encoder_outputs[4]
+            "input_0",   // encoder_outputs[0]
+            "input_1",   // encoder_outputs[1]
+            "input_2",   // encoder_outputs[2]
+            "input_3",   // encoder_outputs[3]
+            "input_4",   // encoder_outputs[3]
         };
 
         if (encoder_outputs.empty()) {
@@ -197,7 +195,6 @@ public:
             // FP16 → FP32 자동 변환 함수 호출
             torch::Tensor t_fp32 = tvmNDArrayToFP32(out);
             t_fp32 = t_fp32.clone().contiguous();
-
             // TVM NDArray 생성
             tvm::runtime::NDArray arr = createNDArrayWithDType(i, t_fp32);
 
@@ -215,16 +212,6 @@ public:
 
         auto dec_tensor = torch::empty(dec_shape, torch::kFloat32);
         decoder_output.CopyToBytes(dec_tensor.data_ptr(), dec_tensor.numel() * sizeof(float));
-
-        for (auto s : dec_tensor.sizes()) std::cout << s << " ";
-        std::cout << "\n";
-
-        std::cout << "Decoder output stats: min="
-                << dec_tensor.min().item<float>()
-                << ", max=" << dec_tensor.max().item<float>()
-                << ", mean=" << dec_tensor.mean().item<float>() << "\n";
-
-        std::cout << "runTVM end!!\n";
         return dec_tensor;
     }
 
@@ -287,6 +274,7 @@ public:
 
         size_t current_idx = 0;
         bool playing = false;
+        auto start = std::chrono::high_resolution_clock::now();
 
         while (current_idx < image_files.size()) {
             std::cout << "Processing: " << image_files[current_idx]
@@ -323,6 +311,10 @@ public:
                 current_idx++;
             }
         }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        std::cout << "Average Processing time: " << duration.count() / (current_idx + 1) << "ms\n";
     }
 
     DLDataType getDLDataType(const torch::Tensor& t) {
