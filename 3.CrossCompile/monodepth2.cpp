@@ -269,7 +269,7 @@ public:
         
         size_t current_idx = 0;
         bool playing = false;
-        
+        auto start = std::chrono::high_resolution_clock::now();
         while (current_idx < image_files.size()) {
             std::cout << "Processing: " << image_files[current_idx] 
                      << " (" << current_idx + 1 << "/" << image_files.size() << ")" << std::endl;
@@ -305,6 +305,10 @@ public:
                 current_idx++;
             }
         }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        std::cout << "Processing time: " << duration.count() << "ms" << std::endl;
     }
 };
 
