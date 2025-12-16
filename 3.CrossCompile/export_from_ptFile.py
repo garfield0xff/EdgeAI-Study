@@ -56,6 +56,10 @@ else:
 print("Converting encoder to Relay IR...")
 mod_enc, params_enc = relay.frontend.from_pytorch(enc_mod, [("input_0", dummy.shape)])
 
+print("Building encoder for TVM...")
+lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
+export_tvm_module(lib_enc, "encoder_deploy")
+
 
 def try_call_decoder(dec, feats):
     with torch.no_grad():
@@ -105,6 +109,10 @@ with torch.no_grad():
     traced_adapter = torch.jit.trace(adapter, tuple(sample_feats))
     print("Converting decoder (adapter) to Relay IR...")
     mod_dec, params_dec = relay.frontend.from_pytorch(traced_adapter, input_list)
+
+print("Building decoder for TVM...")
+lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
+export_tvm_module(lib_dec, "decoder_deploy")
 
 
 print("\n✅ Done. Files are in:", OUTDIR)
